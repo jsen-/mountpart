@@ -1,0 +1,120 @@
+#!/bin/bash
+set -euo pipefail
+if [[ -n ${DEBUG+x} ]]; then set -x; fi
+
+# prerequisites:
+#  - https://github.com/jmattsson/fuseloop
+#  - ubuntu specific: util-linux jq fdisk fuse3 fuse2fs fusefat
+
+function error {
+    local MESSAGE=$@
+    echo -e "\e[31mERR: ${MESSAGE}\e[0m" >&2
+}
+
+function cleanup {
+    [[ -n "${mounted_target+x}" ]] && fusermount -uz "$target"
+    [[ -n "${mounted_medium+x}" ]] && fusermount -uz "$medium"
+    rm -f "$medium"
+}
+
+index=0
+type=""
+opts=""
+exec=""
+help=""
+OPTIONS=$(getopt -o i:t:o:e:h --long index:,type:,opts:,exec:,help -- "$@")
+if [ $? -ne 0 ]; then
+    error "Incorrect options provided: ${OPTIONS}"
+    exit 1
+fi
+eval set -- "${OPTIONS}"
+while true; do
+    case "$1" in
+        -i | --index )            index="$2";              shift; shift;;
+        -t | --type )             type="$2";               shift; shift;;
+        -e | --exec )             exec="$2";               shift; shift;;
+        -o | --opts )             opts="$2";               shift; shift;;
+        -h | --help )             help="true";             shift; break;;
+        -- )                                               shift; break;;
+        * ) if [ -z "$1" ]; then break; else error "Invalid option \"$1\""; exit 1; fi;;
+    esac
+done
+if [[ "$help" == "true" ]]; then
+cat <<EOF
+usage $0 [options...] <image file> [mount dir]
+  options:
+    -i | --index <n>     the index of partition to mount (default: 0)
+    -t | --type <...>    fuse filesystem type (default: autodetection)
+    -o | --opts <...>    options to provide to "mount.fuse -o"
+    -e | --exec <...>    unmount after executing command
+    -h | --help          show this help
+  positional arguments:
+    image file      path to raw disk image
+    mount dir       path to target mount directory (created if missing)
+                    if not provided partion is mounted as raw file in CWD
+EOF
+exit
+fi
+input="$1"; shift;
+target="${1:-""}";
+
+if [[ "$input" == "" ]]; then
+    error "Missing input file"
+    exit 1
+fi
+medium=$(mktemp mountpart.XXXXXXXX)
+
+trap "cleanup" exit
+
+sector_size=512
+size_in_sectors=$(sfdisk -J "$input" | jq ".partitiontable.partitions[$index].size")
+offset_in_sectors=$(sfdisk -J "$input" | jq ".partitiontable.partitions[$index].start")
+size=$((($size_in_sectors)*$sector_size))
+offset=$(($offset_in_sectors*$sector_size))
+
+fuseloop -O "$offset" -S "$size" "$input" "$medium"
+mounted_medium="true"
+
+if [[ "$target" == "" ]]; then
+    echo "$medium"
+else
+    if [[ "$type" == "" ]]; then
+        blkid_output=$(blkid --output export "$medium" || true)
+        detected=""
+        if [[ "$blkid_output" == "" ]]; then
+            error "blkid could not determine partition type"
+        fi
+        detected=$(grep '^TYPE=' <<< $blkid_output | awk -F= '{print $2}')
+        case "$detected" in
+        ext2 | ext3 | ext4 )
+            type=fuse2fs
+            ;;
+        vfat)
+            type=fusefat
+            ;;
+        *)
+            error "partition type autodetection failed, please specify file system type"
+            echo "$blkid_output">&2
+            exit 1
+            ;;
+        esac
+    fi
+
+    if [[ "$type" == "fusefat" ]] && [[ "$opts" == "" ]]; then
+        opts="rw+"
+    fi
+
+    mkdir -p "$target"
+    cmd="mount.fuse $type#$medium $target"
+    if [[ "$opts" != "" ]]; then
+        cmd="$cmd -o $opts"
+    fi
+    $cmd
+    mounted_target="true"
+fi
+
+if [[ "$exec" == "" ]]; then
+    trap - exit
+else
+    $exec
+fi
